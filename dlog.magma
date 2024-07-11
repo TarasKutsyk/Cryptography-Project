@@ -1,0 +1,197 @@
+// Function to partition a group Z_p into 3 parts S_1, S_2, S_3, such that 1 is not in the S_2;
+// The function will just tell the partition number i for a given element x, such that x is in S_i
+function group_partition(x, p)
+    // Calculate partition sizes
+    n := p - 1;
+    third := Ceiling(n / 3);
+
+    if x le third then
+        return 1;
+    elif x le 2 * third then
+        return 2;
+    else
+        return 3;
+    end if;
+end function;
+
+// Function to perform a single step of the Floyd's algorithm:
+// Given element x_i and previous exponents values a_i and b_i, it returns new values f(x_i), a_{i+1}, b_{i+1}
+//
+// It also takes as inputs generator g, h and p, assuming x_i, h, g are elements of Integers(p),
+// and a_i, b_i elements of Integers(ord(g))
+function floyd_step(x_i, a_i, b_i, g, h, p)
+    partition_number := group_partition(x_i, p);
+
+    if partition_number eq 1 then
+        x_next := h * x_i;
+        a_next := a_i;
+        b_next := b_i + 1;
+    elif partition_number eq 2 then
+        x_next := x_i * x_i;
+        a_next := a_i + a_i;
+        b_next := b_i + b_i;
+    else
+        x_next := g * x_i;
+        a_next := a_i + 1;
+        b_next := b_i;
+    end if;
+
+    return Explode(<x_next, a_next, b_next>);
+end function;
+
+function bruteforce_dlog(g, h, n)
+    for j in [0..n-1] do
+        if g^j eq h then
+            return j;
+        end if;
+    end for;
+
+    print "Dlog could not be found with bruteforce.";
+    return -1;
+end function;
+
+// Solve reduced dlog using Pollard's rho method: find a, such that
+// g^a = h mod p, where a is determined modulo order
+function pollard_rho(g, h, p, order)
+    assert IsPrime(p);
+
+    Z_p := Integers(p);
+    Z_order := Integers(order);
+
+    g := Z_p!g;
+    h := Z_p!h;
+
+    // Initialize x_0, x_1 and corresponding exponents a, b
+    x_i := Z_p! 1;
+    a_i := Z_order! 0;
+    b_i := Z_order! 0;
+
+    // Perform the initial step, computing x_1 and x_2 and corresponding exponents a, b
+    x_i, a_i, b_i := floyd_step(x_i, a_i, b_i, g, h, p);
+    x_2i, a_2i, b_2i := floyd_step(x_i, a_i, b_i, g, h, p);
+
+    while x_i ne x_2i do
+        // Single floyd step to compute new x_{i} (and update the corresponding exponents)
+        x_i, a_i, b_i := floyd_step(x_i, a_i, b_i, g, h, p);
+
+        // Double floyd step to compute new x_{2i} (and update the corresponding exponents)
+        x_temp, a_temp, b_temp := floyd_step(x_2i, a_2i, b_2i, g, h, p);
+        x_2i, a_2i, b_2i := floyd_step(x_temp, a_temp, b_temp, g, h, p);
+    end while;
+
+    // This is my modification of the standard Prime-order version of the pollard_rho algorithm from the lecture notes (please check the report for more info)
+    if b_i - b_2i eq 0 then
+        return Z_order! bruteforce_dlog(g, h, order);
+    end if;
+
+    return (a_2i - a_i) * (b_i - b_2i)^-1;
+end function;
+
+// Function analogous to SequenceToInteger() function of Magma, but it operates on sequences of arbitrary integer ring and returns the result in Z_order
+function VectorToInteger(v, p, order)
+    n := #v;
+    integer := Integers(order)! 0;
+
+    for i in [1..n] do
+        integer +:= v[i] * p^(i - 1);
+    end for;
+
+    return integer;
+end function;
+
+// Function implementing Pohlig-Hellman 2 reduction, using the Pollard_rho algorithm in the end
+// n - "global" prime modulo of the group
+// p - current prime factor of the factorization of n-1
+// p_power - power of p in the factorization of n-1
+function ph2_pollard_rho(g, h, n, p, p_power)
+    order := p ^ p_power;
+
+    g_reduced := g^(p^(p_power - 1));
+    log_digits := [];
+
+    // Since the discreet log is determined mod order, we can represent it in base p.
+    // Let's iterate through all the digits of x in base p
+    for i in [1..p_power] do
+        // While the current digit is x_i, we need to solve the reduced log problem in the group of order p,
+        // where the generator is g_reduced, and h is calculated below
+        h_i := h^(p^(p_power - i));
+
+        // Loop through all the recovered log digits, multiplying h by the powers of g in order to have only g_reduced on the left-hand side of the equation
+        for j in [0..#log_digits - 1] do
+            x_j := log_digits[j + 1];
+
+            h_i := h_i * g^(-p^(p_power - i + j) * x_j);
+        end for;
+
+        // Recover the current digit using the pollard_rho algorithm in the subgroup of prime order p
+        x_i := Integers()! pollard_rho(g_reduced, h_i, n, p);
+        Append(~log_digits, x_i); 
+    end for;
+
+    return Integers()! VectorToInteger(log_digits, p, order);
+end function;
+
+// Pohlig-Hellman 1-2 + Pollard-rho algorithm
+function mydLog(g, h, p)
+    Z_p := Integers(p);
+
+    factors := Factorization(p-1);
+    g := Z_p!g;
+    h := Z_p!h;
+    
+    CRT_list := [];
+
+    for i in [1..#factors] do
+        // Pohlig-Hellman 1
+        p_i := factors[i][1];
+        a_i := factors[i][2];
+
+        order := p_i ^ a_i;
+        exponent := Integers()!( (p-1)/(order) );
+
+        a := ph2_pollard_rho(g^exponent, h^exponent, p, p_i, a_i);
+        // Fun fact: this would be Pohlig-Hellman 1 (although it wouldn't work with my implementation of the pollard_rho method in the general case because it expects only prime order groups)
+        // a := Integers()! pollard_rho(g^exponent, h^exponent, p, p_i^a_i);
+        
+        // Constructing lists of elements for CRT 
+        Append(~CRT_list, a); 
+    end for;  
+
+    // Chinese remainder theorem to return to the primary group
+    return CRT(CRT_list, [factors[i][1]^factors[i][2] : i in [1..#factors]]);
+end function;
+
+p2:=130916962986128335495933;
+g2:=1234567;
+h2:=8987654321;
+
+p3:=414304826390894663085077217775069766737984045706834393;
+g3:=3;
+h3:=84318281656754456101525582113633930242753874589745232;
+
+p4:=61294344852064894459531726556015313774866228189507173378513243477879439187099904361304902571461779334873697444860746315181705895930795399804736212231395845509170172244907297;
+g4:=3;
+h4:=31193999329890069452174387010465050164517824681997873624652211221647055931754627821806531500329991205468585941992890174658018838262254470072079790784582168744832886764776898;
+
+// Test vectors in the format <plaintext, key, expected ciphertext>
+test_inputs := [
+    <55, 543212345, 53334366623>,
+    <g2, h2, p2>,   
+    <g3, h3, p3>,
+    <g4, h4, p4>
+];
+
+// Run tests for each vector in the test_inputs list
+for vec in test_inputs do
+    g, h, p := Explode(vec);
+    Z_p := Integers(p);
+    g := Z_p! g;
+
+    log := mydLog(g, h, p);
+
+    if g^log eq h then
+        printf "g^%o = %o == %o => Test successful.\n", log, g^log, h;
+    else
+        printf "g^%o = %o != %o => Test failed.\n", log, g^log, h;
+    end if;
+end for;

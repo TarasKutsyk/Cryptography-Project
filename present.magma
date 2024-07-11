@@ -1,0 +1,157 @@
+M_space := VectorSpace(GF(2), 64); // Block space
+K_space := VectorSpace(GF(2), 80); // Key space
+B_space := VectorSpace(GF(2), 4);  // Brick space
+Round_Key_space := VectorSpace(GF(2), 5); // Round key space
+
+// Substitution Layer code section
+// ----------------------------------------------------
+SBox_From_Integers := [
+    0xC, // S[0x0]
+    0x5, // S[0x1]
+    0x6, // S[0x2]
+    0xB, // S[0x3]
+    0x9, // S[0x4]
+    0x0, // S[0x5]
+    0xA, // S[0x6]
+    0xD, // S[0x7]
+    0x3, // S[0x8]
+    0xE, // S[0x9]
+    0xF, // S[0xA]
+    0x8, // S[0xB]
+    0x4, // S[0xC]
+    0x7, // S[0xD]
+    0x1, // S[0xE]
+    0x2  // S[0xF]
+];
+
+// Function analogous to SequenceToInteger() function of Magma, but it operates on sequences of integers in GF(2)
+function VectorToInteger(v)
+    n := #v;
+    integer := 0;
+
+    for i in [1..n] do
+        integer +:= Integers()!v[i] * 2^(n - i);
+    end for;
+
+    return integer;
+end function;
+
+// Function to perform the substitution on the brick x (i.e. assuming #x = 4)
+function SBox_From_Bricks(x)
+    x_index := VectorToInteger(x) + 1;
+
+    y := SBox_From_Integers[x_index];
+    y_seq := IntegerToSequence(y, 2, 4);
+
+    // Revert the result of IntegerToSequence, because it assumes that the left-most bit is the least significant (while our implementation assumes the opposite)
+    return Reverse(y_seq);
+end function;
+
+// Implement SBox as a (dictionary) map H: VectorSpace(GF(2), 4) -> VectorSpace(GF(2), 4) (where vectors are converted to sequences)
+SBox := AssociativeArray();
+for x in B_space do 
+    x_seq := ElementToSequence(x);
+    SBox[x_seq] := SBox_From_Bricks(x_seq); 
+
+    // printf "%o -> %o\n", x_seq, SBox[x_seq];
+    // printf "%o -> %o\n", VectorToInteger(x_seq), VectorToInteger(SBox[x_seq]);
+end for;
+
+// Finally, define a Substitution Layer for a block x of size 64
+function SubstitutionLayer(x)
+    // Divide the input block x into bricks of 4 bits
+    x_bricks := [x[i..i+3]: i in [1..61 by 4]];
+
+    // Concatenate the SBox images of each brick
+    return &cat [SBox[brick]: brick in x_bricks];
+end function;
+
+// ----------------------------------------------------
+
+// Diffusion layer code section
+// ----------------------------------------------------
+P := [
+    0, 16, 32, 48, 1, 17, 33, 49, 2, 18, 34, 50, 3, 19, 35, 51,     // i = 0..15
+    4, 20, 36, 52, 5, 21, 37, 53, 6, 22, 38, 54, 7, 23, 39, 55,     // i = 16..31
+    8, 24, 40, 56, 9, 25, 41, 57, 10, 26, 42, 58, 11, 27, 43, 59,   // i = 32..47
+    12, 28, 44, 60, 13, 29, 45, 61, 14, 30, 46, 62, 15, 31, 47, 63  // i = 48..63
+];
+P := [p + 1: p in P]; // account for 1-based Magma indexing
+
+// Function to perform the diffusion
+function DiffusionLayer(x)
+    // Simply use multi-indexing feature of Magma
+    return x[P];
+end function;
+// ----------------------------------------------------
+
+// Key Scheduler code section
+// ----------------------------------------------------
+function RoundIndexToBinarySequence(x)
+    // Reverse the result of IntegerToSequence because we want to have least significant bit on the right
+    return Reverse(IntegerToSequence(x, 2, 5));
+end function;
+
+// Procedure for debugging
+procedure PrintBuffer(K)
+    print "\n";
+    for i in [1..80] do
+        printf "%0o -> %o\n", 80-i, K[i];
+    end for;
+    print "\n";
+end procedure;
+
+function GetRoundKeys(K)
+    // K is a sequence of bits, indexed as:  K_79, K_78... K_0 in the paper
+    // However, Magma uses 1-based indexing: K_1, K_2, ..., K_80, so we'll be converting between these indices in the code
+    K := ElementToSequence(K);
+        
+    RoundKeys := [];
+
+    for i in [0..31] do
+        // Extract and store the current round key
+        K_i := K[1..64];
+        RoundKeys := Append(RoundKeys, K_i);
+
+        // Update the key buffer:
+        // 1. Rotate by 61 bit positions to the left (K_18...K_0 from the paper correspond to K[62..80])
+        K := K[62..80] cat K[1..61];
+
+        // 2. The left-most four bits are passed through the S-box
+        K := SBox[K[1..4]] cat K[5..80];
+
+        // 3. Add a round counter (K_19...K_15 from the paper correspond to K[61..65])
+        round_part := Round_Key_space! K[61..65] + Round_Key_space! RoundIndexToBinarySequence(i);
+        K := K[1..60] cat ElementToSequence(round_part) cat K[66..80];
+    end for;
+
+    return RoundKeys;
+end function;
+// ----------------------------------------------------
+
+// ----------------------------------------------------
+// Main part
+function PRESENT_80(m, k)
+    m := M_space! m;
+    k := K_space! k;
+
+    // Call the key scheduler to get the round keys
+    round_keys := GetRoundKeys(k);
+
+    // Perform initial round whitening
+    whitening_key := M_space! round_keys[1];
+    c := m + whitening_key;
+    c := ElementToSequence(c);
+
+    // Main loop that implements the SPN network
+    for i in [1..31] do
+        c := SubstitutionLayer(c);
+        c := DiffusionLayer(c);
+
+        // XOR the working block with the current round key, converting them to linear space elements, and then convert back to sequence
+        c := M_space! c + M_space! round_keys[i+1];
+        c := ElementToSequence(c);
+    end for;
+
+    return M_space! c;
+end function;

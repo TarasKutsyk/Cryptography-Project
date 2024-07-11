@@ -1,0 +1,190 @@
+// Task 3
+// ----------------------------------------------------
+M_space := VectorSpace(GF(2), 64); // Block space
+K_space := VectorSpace(GF(2), 80); // Key space
+B_space := VectorSpace(GF(2), 4);  // Brick space
+Round_Key_space := VectorSpace(GF(2), 5); // Round key space
+
+// A helper function to split the block into left and right parts
+function split_block(b)
+    return Explode([b[1..16], b[17..32]]);
+end function;
+
+
+// Applies the shifting (to the right) function to the given element of VectorSpace(GF(2), 16), 
+// assuming it's passed as a sequence
+function Rot(seq)
+    n := #seq;
+
+    return seq[n-2..n] cat seq[1..n-3];
+end function;
+
+// Applies the inverse shifting (to the left) function to the given element of VectorSpace(GF(2), 16),
+// assuming it's passed as a sequence
+function Rot_inverse(seq)
+    n := #seq;
+
+    return seq[4..n] cat seq[1..3];
+end function;
+
+// Applies S-box to the given element of VectorSpace(GF(2), 16), 
+// assuming it's passed as a sequence
+function ApplySbox(seq)
+    m_new := [];
+
+    // Divide the input vector into the subvectors of 4 bits, applying the same S-box to each bit
+    for i in [1.. 16 by 4] do
+        m_i := S_space! seq[i..i+3];
+        m_i := ElementToSequence(S(m_i));
+
+        // Concatenate to the resulting vector
+        m_new := m_new cat m_i;
+    end for;
+
+    return m_new;
+end function;
+
+
+function GOSTencrypt(m)
+    m_seq := ElementToSequence(m);
+    m_L, m_R := split_block(m_seq);
+
+    for i in [1..12] do
+        // 1st step is omitted: adding a padding key does nothing
+        m_R_new := m_R;
+
+        // 2nd step: apply S-box to each 4-bit block of the right part of the message
+        m_R_new := ApplySbox(m_R_new);
+        // 3d step: apply shifting function to the previous output
+        m_R_new := Rot(m_R_new);
+
+        // Feistel round function output
+        m_L_temp := m_L;
+        m_L := m_R;
+        // Convert to vectors in order to add them, and then convert back to sequence
+        m_R := ElementToSequence(F_space! m_L_temp + F_space! m_R_new);
+    end for;
+
+    return M_space!(m_L cat m_R);
+end function;
+
+// --------------------------------------------------------------
+// Saarinen’s Attack
+// --------------------------------------------------------------
+
+ZERO_SEQ := IntegerToSequence(0, 2, 16);
+PAD_SEQ := IntegerToSequence(2^16 - 1, 2, 16);
+
+// A helper function that calculates a ciphertext from a tuple (x, y), x, y in VectorSpace(GF(2), 16);
+// and returns the ciphertext as a tuple (m_L, m_R)
+function GOSTencrypt_tuple(x, y)
+    m := ElementToSequence(GOSTencrypt(x cat y));
+    return split_block(m);
+end function;
+
+// A helper function that filters all the possible candidates for the image-of-padding, reducing the complexity of bruteforce from 2^16 to 2^4
+// It does this by utilizing the fact that all the S-boxes are equal, so the image-of-padding is the same across the 4 s-boxes
+function is_iop_valid(y)
+    y := Rot_inverse(ElementToSequence(y));
+
+    for i in [1..12 by 4] do
+        if y[i..i+3] ne y[i+4..i+7] then
+            return false;
+        end if;
+    end for;
+
+    return true;
+end function;
+
+function get_image_of_padding()
+    // List to store the candidates for the image of padding
+    iop_candidates := [];
+
+    m_L, m_R := GOSTencrypt_tuple(PAD_SEQ, ZERO_SEQ);
+
+    // Save computation by looking only at periodic candidates (using the fact the all s-boxes are equal)
+    for y in {y: y in F_space| is_iop_valid(y)} do
+        y_seq := ElementToSequence(y);
+
+        m_y_L, m_y_R := GOSTencrypt_tuple(y_seq, PAD_SEQ);
+
+        // The condition below if not sufficient, so the vector y meeting it is only a candidate for being image of padding
+        if m_y_R eq m_L then
+            iop_candidates := Append(iop_candidates, y_seq);
+        end if;
+    end for;
+    
+    iop_candidates := [Rot_inverse(iop): iop in iop_candidates];
+    return iop_candidates;
+end function;
+
+// Oracle for the question "Does F(a) equal to b?", 
+// Assuming a and b are passed as a sequence of length 16
+function F_a_eq_b(a, b)
+    m_a_L, m_a_R := GOSTencrypt_tuple(a, ZERO_SEQ);
+    m_b_L, m_b_R := GOSTencrypt_tuple(b, a);
+
+    return m_b_R eq m_a_L;
+end function;
+
+print("Recovering an image of padding...");
+IOP_list := get_image_of_padding();
+
+// Although I think having multiple candidates here is quite unlikely after our is_iop_valid() validity condition, 
+// I cannot prove that this condition is sufficient, so I'm leaving a way to rerun the program with different candidates
+iop_candidate := 1;
+if #IOP_list gt 1 then
+    printf "There are %o candidate images of padding - consider running the program with different ones. \n", #IOP_list;
+end if;
+
+// Extract only the first 4 elements as an image of padding, because all s-boxes are equal
+iop := IOP_list[iop_candidate][1..4];
+print("Image of padding recovered: "); iop;
+
+// Oracle for the question "Does S(u) equal to v?"
+// Assuming u and v are passed as a sequence of length 4
+function S_u_eq_v(u, v)
+    a_u := u cat PAD_SEQ[1..12];
+    // In the "real" attack we would use different images of padding z_i for each i-th s-box, 
+    // however, here, all 4 s-boxes are equal, so we can use the same image of padding we've recovered above
+    b_v := Rot(v cat iop cat iop cat iop);
+
+    return F_a_eq_b(a_u, b_v);
+end function;
+
+function Saarinen_Attack()
+    recovered_S := AssociativeArray();
+
+    for u_vector in S_space do
+        u := ElementToSequence(u_vector);
+
+        for v_vector in S_space do
+            v := ElementToSequence(v_vector);
+
+            if S_u_eq_v(u, v) then
+                recovered_S[u] := v;
+            end if;
+        end for;
+    end for;
+
+    return recovered_S;
+end function;
+
+
+S_table_true := AssociativeArray();
+for v in S_space do S_table_true[ElementToSequence(v)] := S(v); end for;
+
+print("True S-box: ");
+for u -> v in S_table_true do
+    printf "%o -> %o\n", u, v;
+end for;
+
+
+S_table_recovered := Saarinen_Attack();
+
+print("Recovered S-box: ");
+for u -> v in S_table_recovered do
+    // Print the recovered S-box and check if it matches the true s-box
+    match := S_space!v eq S_table_true[u];
+    printf "%o -> %o <-- %o\n", u, v, match;
+end for;
